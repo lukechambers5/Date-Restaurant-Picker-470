@@ -1,0 +1,5 @@
+data/
+restaurant_reviews.jsonl
+osm_restaurants.jsonl
+__pycache__/
+venv/

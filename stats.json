@@ -1,0 +1,17 @@
+{
+  "metros": [
+    "Philadelphia",
+    "Tampa",
+    "Indianapolis"
+  ],
+  "restaurants_in_metros": 11674,
+  "restaurants_with_5plus_reviews": 11674,
+  "total_reviews": 1241100,
+  "mean_reviews_per_restaurant": 106.3,
+  "median_reviews_per_restaurant": 38.0,
+  "mean_review_words": 106.8,
+  "median_review_words": 78.0,
+  "mean_stars": 3.83,
+  "pct_reviews_with_date_term": 13.4,
+  "pct_restaurants_with_ambience_attr": 78.0
+}
