@@ -1,8 +1,13 @@
 import json, re, sys
 import numpy as np
 import itertools
+from collections import Counter
 from rank_bm25 import BM25Okapi
-from sentence_transformers import SentenceTransformer
+
+try:  # embeddings are optional so the BM25 + lexicon ranker runs on any machine
+    from sentence_transformers import SentenceTransformer
+except ImportError:  # pragma: no cover
+    SentenceTransformer = None
 
 # Date-signal lexicon: term -> weight
 LEX = {"romantic":2,"intimate":2,"cozy":1.5,"candlelit":2,"candle":1.5,"quiet":1.5,
@@ -35,6 +40,7 @@ def tune(s, labels, grid=(0, .5, 1, 2)):
     return best
 
 tok = lambda s: re.findall(r"[a-z']+", s.lower())
+_sent = re.compile(r"(?<=[.!?])\s+")
 
 def load(path="restaurant_reviews.jsonl", max_per=20, max_biz=300):
     docs = {}
@@ -49,37 +55,90 @@ def load(path="restaurant_reviews.jsonl", max_per=20, max_biz=300):
     ids = list(docs)
     return ids, [docs[i] for i in ids]
 
-def expand(q):
+def expand(q, extra=None):
+    """Query tokens + vibe-word expansion. `extra` adds more expansions (e.g. from the quiz)."""
+    ex = {**EXPAND, **(extra or {})}
     t = tok(q)
-    return t + [e for w in t for e in EXPAND.get(w, [])]
+    return t + [e for w in t for e in ex.get(w, [])]
 
 class Searcher:
-    def __init__(self, ids, reviews, model="all-MiniLM-L6-v2"):
+    def __init__(self, ids, reviews, model="all-MiniLM-L6-v2", meta_text=None):
+        """meta_text: optional per-restaurant metadata (name, categories) indexed with the reviews
+        so BM25 matches "italian" even when no review says it; never used for snippets."""
         self.ids, self.reviews = ids, reviews
-        self.docs = [tok(" ".join(r)) for r in reviews]
+        meta_text = meta_text or [""] * len(reviews)
+        self.docs = [tok(" ".join(r) + " " + m) for r, m in zip(reviews, meta_text)]
+        self.tf = [Counter(d) for d in self.docs]
+        self.lens = np.array([max(len(d), 1) for d in self.docs], float)
         self.bm25 = BM25Okapi(self.docs)
-        self.m = SentenceTransformer(model)
-        # embed each review, keep per-restaurant matrix
-        self.emb = [self.m.encode(r, normalize_embeddings=True) for r in reviews]
         # precompute date-signal score (weighted term freq, length-normalized)
-        self.date = np.array([sum(LEX.get(w,0) for w in d)/max(len(d),1) for d in self.docs])
-        self.emb = [self.m.encode(r, normalize_embeddings=True, show_progress_bar=False) for r in reviews]
+        self.date = self.lex_score(LEX)
+        # embed each review, keep per-restaurant matrix (skipped if model=None or not installed)
+        self.m = SentenceTransformer(model) if (model and SentenceTransformer) else None
+        self.emb = ([self.m.encode(r, normalize_embeddings=True, show_progress_bar=False) for r in reviews]
+                    if self.m else None)
 
     @staticmethod
     def z(x):
         x = np.asarray(x, float); s = x.std()
         return (x-x.mean())/s if s else x*0
 
-    def search(self, q, k=10, w=(1.0, 1.0, 0.5), explain=True):
-        bm = self.bm25.get_scores(expand(q))
-        qe = self.m.encode([q], normalize_embeddings=True)[0]
-        sims = [e @ qe for e in self.emb]
-        emb = np.array([np.sort(s)[-3:].mean() for s in sims])  # mean of top-3 passages
-        score = w[0]*self.z(bm) + w[1]*self.z(emb) + w[2]*self.z(self.date)
+    def lex_score(self, lex, idx=None):
+        """Weighted lexicon term frequency / doc length, for docs in idx (default: all)."""
+        idx = range(len(self.docs)) if idx is None else idx
+        return np.array([sum(w * self.tf[i][t] for t, w in lex.items() if t in self.tf[i]) / self.lens[i]
+                         for i in idx])
+
+    def score(self, q, w=(1.0, 1.0, 0.5), extra_lex=None, extra_expand=None, idx=None):
+        """Hybrid score for docs in idx. extra_lex adds/overrides lexicon weights (quiz terms).
+        Returns (idx, score, parts, sims) where parts holds each component's z-score."""
+        idx = np.arange(len(self.ids)) if idx is None else np.asarray(idx, int)
+        bm = self.bm25.get_scores(expand(q, extra_expand))[idx]
+        date = self.date[idx] if not extra_lex else self.lex_score({**LEX, **extra_lex}, idx)
+        sims = None
+        if self.m is not None:
+            qe = self.m.encode([q], normalize_embeddings=True)[0]
+            sims = {int(i): self.emb[i] @ qe for i in idx}
+            emb = np.array([np.sort(sims[int(i)])[-3:].mean() for i in idx])  # mean of top-3 passages
+        else:
+            emb = np.zeros(len(idx))
+        parts = {"bm25": self.z(bm), "embedding": self.z(emb), "date": self.z(date)}
+        score = w[0]*parts["bm25"] + w[1]*parts["embedding"] + w[2]*parts["date"]
+        return idx, score, parts, sims
+
+    def search(self, q, k=10, w=(1.0, 1.0, 0.5), explain=True, extra_lex=None, idx=None):
+        idx, score, _, sims = self.score(q, w, extra_lex, idx=idx)
         out = []
-        for i in np.argsort(-score)[:k]:
-            snip = self.reviews[i][int(np.argmax(sims[i]))][:200] if explain else ""
-            out.append((self.ids[i], float(score[i]), snip))
+        for j in np.argsort(-score)[:k]:
+            i = int(idx[j])
+            snip = ""
+            if explain:
+                snip = (self.reviews[i][int(np.argmax(sims[i]))][:200] if sims is not None
+                        else (self.snippets(i, q, n=1) or [""])[0])
+            out.append((self.ids[i], float(score[j]), snip))
+        return out
+
+    def snippets(self, i, q, n=2, extra_lex=None, sims=None):
+        """'Date fit' explanation: the review sentences that best support the ranking."""
+        lex = {**LEX, **(extra_lex or {})}
+        qt = set(expand(q))
+        best = []
+        order = (np.argsort(-sims)[:5] if sims is not None else range(len(self.reviews[i])))
+        for r in order:
+            for s in _sent.split(self.reviews[i][int(r)]):
+                ts = tok(s)
+                if len(ts) < 4:
+                    continue
+                sc = sum(1.0 for t in ts if t in qt) + sum(max(lex.get(t, 0), 0) for t in ts)
+                if sc > 0:
+                    best.append((sc / (len(ts) ** 0.3), s.strip()[:220]))
+        best.sort(key=lambda x: -x[0])
+        seen, out = set(), []
+        for _, s in best:
+            if s not in seen:
+                seen.add(s); out.append(s)
+            if len(out) == n:
+                break
         return out
 
     def aspect_scores(self, i):
