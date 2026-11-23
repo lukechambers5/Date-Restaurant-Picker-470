@@ -1,5 +1,6 @@
 rank_bm25
 numpy
 flask
+gunicorn
 # optional: semantic matching (set EMBED_MODEL=all-MiniLM-L6-v2)
 # sentence-transformers
