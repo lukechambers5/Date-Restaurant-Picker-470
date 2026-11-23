@@ -1,5 +1,8 @@
 data/
 restaurant_reviews.jsonl
+!sample_data/restaurant_reviews.jsonl
 osm_restaurants.jsonl
 __pycache__/
 venv/
+node_modules/
+frontend/dist/
